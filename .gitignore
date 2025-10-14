@@ -1,0 +1,28 @@
+# Large files and training artifacts
+grid_search_results/run_*
+*.pth
+*.pt
+*.h5
+*.hdf5
+
+# Dataset files (too large for git)
+Nutrition5K/
+nutrition5k/
+datasets/
+
+# Cache and temp files
+__pycache__/
+*.pyc
+*.pyo
+.cache/
+
+# IDE and system files
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Large output files
+*.zip
+*.tar.gz
+*.rar

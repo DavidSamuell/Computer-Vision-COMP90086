@@ -1,0 +1,18 @@
+# Nutrition5K Calorie Prediction - Requirements
+
+# Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Data Processing
+numpy>=1.24.0
+pandas>=2.0.0
+Pillow>=9.5.0
+
+# Training Utilities
+tqdm>=4.65.0
+tensorboard>=2.13.0
+
+# Visualization (optional, for debugging)
+matplotlib>=3.7.0
+
