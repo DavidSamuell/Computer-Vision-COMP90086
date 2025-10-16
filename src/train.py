@@ -17,30 +17,34 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from dataset import Nutrition5KDataset, create_train_val_split
-from model import MultiStreamCaloriePredictor
+from model import MultiStreamCaloriePredictor, build_model
 
 
 class MultiTaskLoss(nn.Module):
     """
     Combined loss for multi-task learning:
     Total Loss = MSE Loss (Calories) + BCE Loss (Segmentation)
+    
+    Can also be used for single-task (calorie prediction only) by setting use_segmentation=False
     """
     
-    def __init__(self, calorie_weight: float = 1.0, seg_weight: float = 1.0):
+    def __init__(self, calorie_weight: float = 1.0, seg_weight: float = 1.0, use_segmentation: bool = True):
         super().__init__()
         self.calorie_weight = calorie_weight
         self.seg_weight = seg_weight
+        self.use_segmentation = use_segmentation
         
         self.mse_loss = nn.MSELoss()
-        self.bce_loss = nn.BCEWithLogitsLoss()
+        if self.use_segmentation:
+            self.bce_loss = nn.BCEWithLogitsLoss()
     
     def forward(self, calorie_pred, seg_pred, calorie_target, seg_target):
         """
         Args:
             calorie_pred: (B, 1) predicted calories
-            seg_pred: (B, 1, H, W) predicted segmentation logits
+            seg_pred: (B, 1, H, W) predicted segmentation logits or None if use_segmentation=False
             calorie_target: (B,) or (B, 1) target calories
-            seg_target: (B, 1, H, W) target segmentation masks
+            seg_target: (B, 1, H, W) target segmentation masks or dummy tensor
         
         Returns:
             total_loss, calorie_loss, seg_loss
@@ -52,11 +56,13 @@ class MultiTaskLoss(nn.Module):
         # Calorie loss (MSE)
         calorie_loss = self.mse_loss(calorie_pred, calorie_target)
         
-        # Segmentation loss (BCE with logits)
-        seg_loss = self.bce_loss(seg_pred, seg_target)
-        
-        # Combined loss
-        total_loss = self.calorie_weight * calorie_loss + self.seg_weight * seg_loss
+        # Segmentation loss (BCE with logits) - only if enabled
+        if self.use_segmentation and seg_pred is not None:
+            seg_loss = self.bce_loss(seg_pred, seg_target)
+            total_loss = self.calorie_weight * calorie_loss + self.seg_weight * seg_loss
+        else:
+            seg_loss = torch.tensor(0.0, device=calorie_pred.device)
+            total_loss = self.calorie_weight * calorie_loss
         
         return total_loss, calorie_loss, seg_loss
 
@@ -115,7 +121,8 @@ class Trainer:
         scheduler,
         device,
         output_dir,
-        early_stopping_patience=15
+        early_stopping_patience=15,
+        scheduler_step_on_batch=False
     ):
         self.model = model
         self.train_loader = train_loader
@@ -125,6 +132,7 @@ class Trainer:
         self.scheduler = scheduler
         self.device = device
         self.output_dir = output_dir
+        self.scheduler_step_on_batch = scheduler_step_on_batch
         
         # Early stopping
         self.early_stopping = EarlyStopping(
@@ -140,6 +148,20 @@ class Trainer:
         self.best_val_loss = float('inf')
         self.train_losses = []
         self.val_losses = []
+        
+        # Track best metrics
+        self.best_metrics = {
+            'epoch': 0,
+            'train_loss': 0.0,
+            'train_calorie_loss': 0.0,
+            'train_seg_loss': 0.0,
+            'val_loss': float('inf'),
+            'val_calorie_loss': 0.0,
+            'val_seg_loss': 0.0,
+            'mae': 0.0,
+            'mse': 0.0,
+            'mape': 0.0
+        }
         
     def train_epoch(self, epoch):
         """Train for one epoch"""
@@ -174,6 +196,10 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             
             self.optimizer.step()
+            
+            # Step scheduler if it's per-batch (Cosine, OneCycle)
+            if self.scheduler is not None and self.scheduler_step_on_batch:
+                self.scheduler.step()
             
             # Track losses
             total_loss += loss.item()
@@ -274,12 +300,15 @@ class Trainer:
             # Validate
             val_loss, val_cal_loss, val_seg_loss, mae, mse, mape = self.validate(epoch)
             
-            # Learning rate scheduling
-            if self.scheduler is not None:
-                self.scheduler.step(val_loss)
-                current_lr = self.optimizer.param_groups[0]['lr']
-            else:
-                current_lr = self.optimizer.param_groups[0]['lr']
+            # Learning rate scheduling (only for epoch-based schedulers)
+            if self.scheduler is not None and not self.scheduler_step_on_batch:
+                # ReduceLROnPlateau needs val_loss
+                if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                    self.scheduler.step(val_loss)
+                else:
+                    self.scheduler.step()
+            
+            current_lr = self.optimizer.param_groups[0]['lr']
             
             # Log to tensorboard
             self.writer.add_scalar('Loss/train', train_loss, epoch)
@@ -303,6 +332,24 @@ class Trainer:
             # Save best model
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
+                
+                # Update best metrics
+                self.best_metrics = {
+                    'epoch': epoch,
+                    'train_loss': train_loss,
+                    'train_calorie_loss': train_cal_loss,
+                    'train_seg_loss': train_seg_loss,
+                    'val_loss': val_loss,
+                    'val_calorie_loss': val_cal_loss,
+                    'val_seg_loss': val_seg_loss,
+                    'mae': mae,
+                    'mse': mse,
+                    'mape': mape
+                }
+                
+                # Save best metrics to file
+                self.save_best_metrics()
+                
                 self.save_checkpoint(epoch, is_best=True)
                 print(f"  ✓ New best model saved! (Val Loss: {val_loss:.4f})")
             
@@ -324,7 +371,15 @@ class Trainer:
         
         print(f"\n{'='*60}")
         print(f"Training Complete!")
-        print(f"Best validation loss: {self.best_val_loss:.4f}")
+        print(f"{'='*60}")
+        print(f"\nBest Results (Epoch {self.best_metrics['epoch']}):")
+        print(f"  Validation Loss: {self.best_metrics['val_loss']:.4f}")
+        print(f"  Training Loss:   {self.best_metrics['train_loss']:.4f}")
+        print(f"  Val Calorie Loss: {self.best_metrics['val_calorie_loss']:.4f}")
+        print(f"  Val Seg Loss:     {self.best_metrics['val_seg_loss']:.4f}")
+        print(f"  MAE:  {self.best_metrics['mae']:.2f} kcal")
+        print(f"  MSE:  {self.best_metrics['mse']:.2f}")
+        print(f"  MAPE: {self.best_metrics['mape']:.2f}%")
         print(f"{'='*60}\n")
     
     def save_checkpoint(self, epoch, is_best=False, name=None):
@@ -346,6 +401,20 @@ class Trainer:
         
         checkpoint_path = os.path.join(self.output_dir, name)
         torch.save(checkpoint, checkpoint_path)
+    
+    def save_best_metrics(self):
+        """Save best metrics to JSON file"""
+        metrics_path = os.path.join(self.output_dir, 'best_metrics.json')
+        
+        # Convert all values to native Python types for JSON serialization
+        serializable_metrics = {
+            key: float(value) if isinstance(value, (np.floating, np.integer)) else value
+            for key, value in self.best_metrics.items()
+        }
+        
+        with open(metrics_path, 'w') as f:
+            json.dump(serializable_metrics, f, indent=4)
+        print(f"  ✓ Best metrics saved to {metrics_path}")
 
 
 def main():
@@ -359,7 +428,24 @@ def main():
     parser.add_argument('--val_ratio', type=float, default=0.15,
                         help='Validation split ratio')
     
-    # Model
+    # Model architecture (modular system)
+    parser.add_argument('--encoder', type=str, default='resnet18',
+                        choices=['resnet18', 'resnet34', 'resnet50', 
+                                'early_fusion_resnet18', 'early_fusion_resnet34'],
+                        help='Encoder architecture')
+    parser.add_argument('--fusion', type=str, default='middle',
+                        choices=['middle', 'middle_attention', 'additive', 
+                                'cross_modal_attention', 'gated', 'inception',
+                                'late_average', 'late_weighted'],
+                        help='Fusion strategy (ignored for early_fusion encoders)')
+    parser.add_argument('--regression_head', type=str, default='standard',
+                        choices=['standard', 'deep', 'light', 'minimal', 'se'],
+                        help='Regression head type')
+    parser.add_argument('--segmentation_head', type=str, default='standard',
+                        choices=['standard', 'light', 'fpn'],
+                        help='Segmentation head type')
+    
+    # Model hyperparameters
     parser.add_argument('--dropout', type=float, default=0.4,
                         help='Dropout rate for regularization')
     parser.add_argument('--fusion_channels', type=int, default=512,
@@ -372,6 +458,9 @@ def main():
                         help='Maximum number of epochs')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Learning rate')
+    parser.add_argument('--scheduler', type=str, default='linear',
+                        choices=['linear', 'cosine_warm_restarts', 'reduce_on_plateau', 'one_cycle', 'none'],
+                        help='Learning rate scheduler type')
     parser.add_argument('--weight_decay', type=float, default=1e-4,
                         help='Weight decay (L2 regularization)')
     parser.add_argument('--early_stopping_patience', type=int, default=15,
@@ -381,12 +470,18 @@ def main():
     parser.add_argument('--calorie_weight', type=float, default=1.0,
                         help='Weight for calorie loss')
     parser.add_argument('--seg_weight', type=float, default=0.5,
-                        help='Weight for segmentation loss')
+                        help='Weight for segmentation loss (only used if --use_segmentation)')
+    parser.add_argument('--use_segmentation', action='store_true', default=False,
+                        help='Enable segmentation as auxiliary task (default: disabled)')
+    parser.add_argument('--no_segmentation', dest='use_segmentation', action='store_false',
+                        help='Disable segmentation task (calorie prediction only) - this is the default')
     
     # Data augmentation
     parser.add_argument('--img_size', type=int, default=224,
                         help='Image size for resizing')
-    parser.add_argument('--no_augment', action='store_true',
+    parser.add_argument('--augment', dest='use_augment', action='store_true', default=True,
+                        help='Enable data augmentation (default: enabled)')
+    parser.add_argument('--no_augment', dest='use_augment', action='store_false',
                         help='Disable data augmentation')
     
     # Output
@@ -436,20 +531,24 @@ def main():
     
     # Create datasets
     print("Loading datasets...")
+    print(f"Data augmentation: {'ENABLED' if args.use_augment else 'DISABLED'}")
+    
     train_dataset = Nutrition5KDataset(
         csv_path=train_csv,
         data_root=args.data_root,
         split='train',
-        augment=not args.no_augment,
-        img_size=args.img_size
+        augment=args.use_augment,
+        img_size=args.img_size,
+        use_segmentation=args.use_segmentation
     )
     
     val_dataset = Nutrition5KDataset(
         csv_path=val_csv,
         data_root=args.data_root,
         split='val',
-        augment=False,
-        img_size=args.img_size
+        augment=False,  # Never augment validation data
+        img_size=args.img_size,
+        use_segmentation=args.use_segmentation
     )
     
     # Create data loaders
@@ -470,12 +569,21 @@ def main():
         pin_memory=True if torch.cuda.is_available() else False
     )
     
-    # Create model
+    # Create model (use modular system)
     print("\nBuilding model...")
-    model = MultiStreamCaloriePredictor(
+    print(f"Architecture: {args.encoder} + {args.fusion} fusion")
+    print(f"Heads: {args.regression_head} (regression), {args.segmentation_head} (segmentation)")
+    print(f"Segmentation task: {'ENABLED' if args.use_segmentation else 'DISABLED (calorie prediction only)'}")
+    
+    model = build_model(
+        encoder=args.encoder,
+        fusion=args.fusion,
+        regression_head=args.regression_head,
+        segmentation_head=args.segmentation_head,
         pretrained=False,  # Training from scratch as per constraints
         dropout_rate=args.dropout,
-        fusion_channels=args.fusion_channels
+        fusion_channels=args.fusion_channels,
+        use_segmentation=args.use_segmentation
     )
     model = model.to(device)
     
@@ -484,7 +592,8 @@ def main():
     # Create loss function
     criterion = MultiTaskLoss(
         calorie_weight=args.calorie_weight,
-        seg_weight=args.seg_weight
+        seg_weight=args.seg_weight,
+        use_segmentation=args.use_segmentation
     )
     
     # Create optimizer with weight decay (L2 regularization)
@@ -494,13 +603,53 @@ def main():
         weight_decay=args.weight_decay
     )
     
-    # Create learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=0.5,
-        patience=5
-    )
+    # Create learning rate scheduler based on user choice
+    if args.scheduler == 'linear':
+        # Linear decay from initial LR to 0
+        scheduler = optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1.0,
+            end_factor=0.0,
+            total_iters=args.num_epochs
+        )
+        scheduler_step_on_batch = False  # Step after each epoch
+        
+    elif args.scheduler == 'cosine_warm_restarts':
+        # Cosine Annealing with Warm Restarts (Best for limited data)
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=10,         # Restart every 10 epochs
+            T_mult=2,       # Double the period after each restart (10, 20, 40...)
+            eta_min=1e-7    # Minimum learning rate
+        )
+        scheduler_step_on_batch = True  # Step after each batch
+        
+    elif args.scheduler == 'reduce_on_plateau':
+        # ReduceLROnPlateau (Original, more conservative settings)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=0.7,     # Less aggressive than 0.5
+            patience=10,    # More patient than 5
+            min_lr=1e-7
+        )
+        scheduler_step_on_batch = False  # Step after each epoch
+        
+    elif args.scheduler == 'one_cycle':
+        # OneCycleLR (Fast training)
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=args.lr * 10,
+            epochs=args.num_epochs,
+            steps_per_epoch=len(train_loader),
+            pct_start=0.3,  # 30% warmup
+            anneal_strategy='cos'
+        )
+        scheduler_step_on_batch = True  # Step after each batch
+        
+    else:  # args.scheduler == 'none'
+        scheduler = None
+        scheduler_step_on_batch = False
     
     # Create trainer
     trainer = Trainer(
@@ -512,7 +661,8 @@ def main():
         scheduler=scheduler,
         device=device,
         output_dir=output_dir,
-        early_stopping_patience=args.early_stopping_patience
+        early_stopping_patience=args.early_stopping_patience,
+        scheduler_step_on_batch=scheduler_step_on_batch
     )
     
     # Train

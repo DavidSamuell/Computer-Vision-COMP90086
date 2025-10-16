@@ -8,6 +8,7 @@ import argparse
 import pandas as pd
 import torch
 import numpy as np
+import json
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import torchvision.transforms.functional as TF
@@ -15,7 +16,7 @@ from torchvision.transforms import Normalize
 from tqdm import tqdm
 import warnings
 
-from model import MultiStreamCaloriePredictor
+from model import MultiStreamCaloriePredictor, build_model
 
 
 class TestDataset(Dataset):
@@ -171,11 +172,34 @@ class TestInference:
     
     def _load_model(self):
         """Load trained model from checkpoint"""
-        # Create model
-        model = MultiStreamCaloriePredictor(
-            pretrained=False,
-            dropout_rate=0.4  # Dropout is disabled during inference anyway
-        )
+        # Try to load config file from the model directory
+        model_dir = os.path.dirname(self.model_path)
+        config_path = os.path.join(model_dir, 'config.json')
+        
+        if os.path.exists(config_path):
+            print(f"Loading model config from: {config_path}")
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            
+            # Create model using the build_model function with saved config
+            model = build_model(
+                encoder=config.get('encoder', 'resnet18'),
+                fusion=config.get('fusion', 'middle'),
+                regression_head=config.get('regression_head', 'standard'),
+                segmentation_head=config.get('segmentation_head', 'standard'),
+                pretrained=False,
+                dropout_rate=config.get('dropout', 0.4),
+                fusion_channels=config.get('fusion_channels', 512)
+            )
+            print(f"Model architecture: {config.get('encoder', 'resnet18')} + {config.get('fusion', 'middle')} fusion")
+        else:
+            print(f"Warning: Config file not found at {config_path}")
+            print("Using default ResNet-18 architecture")
+            # Fallback to default model
+            model = MultiStreamCaloriePredictor(
+                pretrained=False,
+                dropout_rate=0.4
+            )
         
         # Load checkpoint
         try:
@@ -305,12 +329,196 @@ class TestInference:
         return submission_df
 
 
+class EnsembleInference:
+    """Ensemble inference engine for multiple models"""
+    
+    def __init__(self, model_paths, device='cuda'):
+        """
+        Initialize ensemble with multiple models
+        
+        Args:
+            model_paths: List of paths to model checkpoints
+            device: Device to run inference on
+        """
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.models = []
+        self.model_paths = model_paths
+        
+        print(f"Loading {len(model_paths)} models for ensemble...")
+        
+        for i, model_path in enumerate(model_paths, 1):
+            print(f"  Loading model {i}/{len(model_paths)}: {os.path.basename(model_path)}")
+            
+            # Load checkpoint
+            checkpoint = torch.load(model_path, map_location=self.device)
+            
+            # Get model config
+            if 'config' in checkpoint:
+                config = checkpoint['config']
+                print(f"    Config: encoder={config.get('encoder', 'resnet18')}, fusion={config.get('fusion', 'middle')}, use_seg={config.get('use_segmentation', False)}")
+                model = build_model(
+                    encoder=config.get('encoder', 'resnet18'),
+                    fusion=config.get('fusion', 'middle'),
+                    regression_head=config.get('regression_head', 'standard'),
+                    segmentation_head=config.get('segmentation_head', 'standard'),
+                    pretrained=False,
+                    dropout_rate=config.get('dropout', 0.4),  # Fix: use 'dropout' not 'dropout_rate'
+                    fusion_channels=config.get('fusion_channels', 512),
+                    use_segmentation=config.get('use_segmentation', False)
+                )
+            else:
+                # Try to infer from checkpoint keys
+                state_dict_keys = list(checkpoint['model_state_dict'].keys())
+                has_segmentation = any('segmentation_head' in key for key in state_dict_keys)
+                has_inception = any('branch1x1' in key or 'branch3x3' in key for key in state_dict_keys)
+                
+                print(f"    Warning: No config found, inferring from state_dict")
+                print(f"    Detected: segmentation={has_segmentation}, inception_fusion={has_inception}")
+                
+                # Build model based on detected architecture
+                fusion_type = 'inception' if has_inception else 'middle'
+                model = build_model(
+                    encoder='resnet18',
+                    fusion=fusion_type,
+                    regression_head='standard',
+                    segmentation_head='standard',
+                    pretrained=False,
+                    dropout_rate=0.4,
+                    fusion_channels=512,
+                    use_segmentation=has_segmentation
+                )
+            
+            # Load state dict
+            model.load_state_dict(checkpoint['model_state_dict'])
+            model.to(self.device)
+            model.eval()
+            
+            self.models.append(model)
+        
+        print(f"✓ Ensemble ready with {len(self.models)} models")
+    
+    def predict_batch(self, rgb_batch, depth_batch):
+        """
+        Predict on a batch using ensemble averaging
+        
+        Args:
+            rgb_batch: RGB images tensor (B, 3, H, W) - already on device
+            depth_batch: Depth images tensor (B, 1, H, W) - already on device
+        
+        Returns:
+            Ensemble averaged predictions (B, 1)
+        """
+        
+        predictions = []
+        
+        with torch.no_grad():
+            for model in self.models:
+                # Get prediction from this model
+                if hasattr(model, 'forward'):
+                    calorie_pred, _ = model(rgb_batch, depth_batch)
+                else:
+                    calorie_pred = model(rgb_batch, depth_batch)
+                
+                predictions.append(calorie_pred)
+        
+        # Average predictions across all models
+        ensemble_pred = torch.stack(predictions, dim=0).mean(dim=0)
+        
+        return ensemble_pred
+    
+    def predict_test_set(self, test_dataset, batch_size=32, num_workers=4):
+        """
+        Run ensemble inference on entire test set
+        
+        Args:
+            test_dataset: TestDataset instance
+            batch_size: Batch size for inference
+            num_workers: Number of data loading workers
+        
+        Returns:
+            predictions: Dict mapping dish_id to predicted calories
+            failed_samples: List of dish_ids that failed
+        """
+        dataloader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True if self.device.type == 'cuda' else False
+        )
+        
+        predictions = {}
+        failed_samples = []
+        
+        print(f"\nRunning ensemble inference on {len(test_dataset)} samples...")
+        print(f"Using {len(self.models)} models for averaging")
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(tqdm(dataloader, desc="Ensemble Inference")):
+                try:
+                    # Move to device
+                    rgb_batch = batch['rgb'].to(self.device)
+                    depth_batch = batch['depth'].to(self.device)
+                    dish_ids = batch['dish_id']
+                    is_valid = batch['is_valid']
+                    
+                    # Get ensemble predictions
+                    pred_batch = self.predict_batch(rgb_batch, depth_batch)
+                    
+                    # Convert predictions to CPU and store
+                    pred_batch = pred_batch.cpu().numpy().flatten()
+                    
+                    # Store predictions
+                    for i, dish_id in enumerate(dish_ids):
+                        if is_valid[i]:
+                            predictions[dish_id] = float(pred_batch[i])
+                        else:
+                            # Flag failed samples
+                            failed_samples.append(dish_id)
+                            predictions[dish_id] = 0.0  # Default prediction for failed samples
+                        
+                except Exception as e:
+                    print(f"\nWarning: Batch {batch_idx} failed: {e}")
+                    # Add failed samples with default prediction (if dish_ids is available)
+                    if 'dish_id' in batch:
+                        for dish_id in batch['dish_id']:
+                            predictions[dish_id] = 0.0
+                            failed_samples.append(dish_id)
+        
+        print(f"✓ Ensemble inference complete: {len(predictions)} predictions")
+        return predictions, failed_samples
+    
+    def create_submission_file(self, predictions, all_dish_ids, output_path):
+        """Create submission CSV file from ensemble predictions"""
+        submission_data = []
+        
+        for dish_id in all_dish_ids:
+            calorie_pred = predictions.get(dish_id, 0.0)
+            submission_data.append({
+                'ID': dish_id,
+                'Value': max(0.0, calorie_pred)  # Ensure non-negative
+            })
+        
+        submission_df = pd.DataFrame(submission_data)
+        submission_df.to_csv(output_path, index=False)
+        
+        print(f"✓ Ensemble submission saved: {output_path}")
+        print(f"  Samples: {len(submission_df)}")
+        print(f"  Avg prediction: {submission_df['Value'].mean():.1f} kcal")
+        print(f"  Min prediction: {submission_df['Value'].min():.1f} kcal")
+        print(f"  Max prediction: {submission_df['Value'].max():.1f} kcal")
+        
+        return submission_df
+
+
 def main():
     parser = argparse.ArgumentParser(description='Test Set Inference for Calorie Prediction')
     
     # Required arguments
-    parser.add_argument('--model_path', type=str, required=True,
+    parser.add_argument('--model_path', type=str, required=False,
                         help='Path to trained model checkpoint (.pth file)')
+    parser.add_argument('--model_paths', type=str, nargs='+', required=False,
+                        help='Paths to multiple model checkpoints for ensemble inference')
     parser.add_argument('--test_root', type=str, required=True,
                         help='Path to test data directory (containing color/ and depth_raw/)')
     
@@ -332,10 +540,29 @@ def main():
     
     args = parser.parse_args()
     
+    # Validate arguments
+    if not args.model_path and not args.model_paths:
+        parser.error("Either --model_path or --model_paths must be provided")
+    if args.model_path and args.model_paths:
+        parser.error("Cannot use both --model_path and --model_paths simultaneously")
+    
+    # Determine if ensemble or single model
+    if args.model_paths:
+        model_paths = args.model_paths
+        is_ensemble = True
+    else:
+        model_paths = [args.model_path]
+        is_ensemble = False
+    
     print("="*80)
     print("TEST SET INFERENCE - NUTRITION5K CALORIE PREDICTION")
     print("="*80)
-    print(f"Model: {args.model_path}")
+    if is_ensemble:
+        print(f"ENSEMBLE MODE: {len(model_paths)} models")
+        for i, path in enumerate(model_paths, 1):
+            print(f"  Model {i}: {path}")
+    else:
+        print(f"SINGLE MODEL: {model_paths[0]}")
     print(f"Test data: {args.test_root}")
     print(f"Output: {args.output_path}")
     print(f"Batch size: {args.batch_size}")
@@ -343,8 +570,9 @@ def main():
     print("="*80)
     
     # Validate inputs
-    if not os.path.exists(args.model_path):
-        raise FileNotFoundError(f"Model not found: {args.model_path}")
+    for model_path in model_paths:
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model not found: {model_path}")
     
     if not os.path.exists(args.test_root):
         raise FileNotFoundError(f"Test data not found: {args.test_root}")
@@ -356,34 +584,60 @@ def main():
         img_size=args.img_size
     )
     
-    # Create inference engine
-    print("\nInitializing inference engine...")
-    inference = TestInference(
-        model_path=args.model_path,
-        device=args.device
-    )
-    
-    # Run inference
-    predictions, failed_samples = inference.predict_test_set(
-        test_dataset=test_dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers
-    )
-    
-    # Create submission file
-    all_dish_ids = test_dataset.get_all_dish_ids()
-    submission_df = inference.create_submission_file(
-        predictions=predictions,
-        all_dish_ids=all_dish_ids,
-        output_path=args.output_path
-    )
+    if is_ensemble:
+        # Ensemble inference
+        print(f"\nInitializing ensemble with {len(model_paths)} models...")
+        ensemble_inference = EnsembleInference(
+            model_paths=model_paths,
+            device=args.device
+        )
+        
+        # Run ensemble inference
+        predictions, failed_samples = ensemble_inference.predict_test_set(
+            test_dataset=test_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers
+        )
+        
+        # Create submission file
+        all_dish_ids = test_dataset.get_all_dish_ids()
+        submission_df = ensemble_inference.create_submission_file(
+            predictions=predictions,
+            all_dish_ids=all_dish_ids,
+            output_path=args.output_path
+        )
+    else:
+        # Single model inference
+        print("\nInitializing single model inference...")
+        inference = TestInference(
+            model_path=model_paths[0],
+            device=args.device
+        )
+        
+        # Run inference
+        predictions, failed_samples = inference.predict_test_set(
+            test_dataset=test_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers
+        )
+        
+        # Create submission file
+        all_dish_ids = test_dataset.get_all_dish_ids()
+        submission_df = inference.create_submission_file(
+            predictions=predictions,
+            all_dish_ids=all_dish_ids,
+            output_path=args.output_path
+        )
     
     print("\n" + "="*80)
     print("INFERENCE COMPLETE!")
     print("="*80)
     print(f"Submission file ready: {args.output_path}")
+    print(f"Total samples: {len(submission_df)}")
     if failed_samples:
-        print(f"Note: {len(failed_samples)} samples had issues and were set to 0.0")
+        print(f"Failed samples: {len(failed_samples)}")
+    if is_ensemble:
+        print(f"Ensemble averaging: {len(model_paths)} models")
     print("="*80)
 
 

@@ -19,7 +19,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from dataset import Nutrition5KDataset, create_train_val_split
-from model import MultiStreamCaloriePredictor
+from model import MultiStreamCaloriePredictor, build_model
 from train import MultiTaskLoss, EarlyStopping, Trainer
 
 
@@ -184,12 +184,24 @@ class GridSearcher:
             pin_memory=True if torch.cuda.is_available() else False
         )
         
-        # Create model
-        model = MultiStreamCaloriePredictor(
-            pretrained=False,
-            dropout_rate=params['dropout'],
-            fusion_channels=512
-        )
+        # Create model (use modular system if encoder is specified)
+        if 'encoder' in params:
+            model = build_model(
+                encoder=params.get('encoder', 'resnet18'),
+                fusion=params.get('fusion', 'middle'),
+                regression_head=params.get('regression_head', 'standard'),
+                segmentation_head=params.get('segmentation_head', 'standard'),
+                pretrained=False,
+                dropout_rate=params['dropout'],
+                fusion_channels=params.get('fusion_channels', 512)
+            )
+        else:
+            # Fallback to original model for backward compatibility
+            model = MultiStreamCaloriePredictor(
+                pretrained=False,
+                dropout_rate=params['dropout'],
+                fusion_channels=512
+            )
         model = model.to(self.device)
         
         # Create loss function
@@ -373,6 +385,14 @@ def main():
     parser.add_argument('--custom_grid', type=str, default=None,
                         help='Path to JSON file with custom parameter grid')
     
+    # Model architecture (optional - for testing different architectures)
+    parser.add_argument('--encoder', type=str, default=None,
+                        choices=['resnet18', 'resnet34', 'resnet50'],
+                        help='Encoder architecture (overrides grid if specified)')
+    parser.add_argument('--fusion', type=str, default=None,
+                        choices=['middle', 'middle_attention', 'additive'],
+                        help='Fusion strategy (overrides grid if specified)')
+    
     args = parser.parse_args()
     
     # Define parameter grid
@@ -392,6 +412,12 @@ def main():
             'calorie_weight': [1.0],
             'seg_weight': [0.3, 0.5, 0.7]
         }
+    
+    # Add architecture parameters if specified via command line
+    if args.encoder is not None:
+        param_grid['encoder'] = [args.encoder]
+    if args.fusion is not None:
+        param_grid['fusion'] = [args.fusion]
     
     print("\nParameter Grid:")
     print("-" * 80)
