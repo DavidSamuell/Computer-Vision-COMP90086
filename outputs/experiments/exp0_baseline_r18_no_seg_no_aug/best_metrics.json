@@ -1,0 +1,12 @@
+{
+    "epoch": 12,
+    "train_loss": 9975.280767331178,
+    "train_calorie_loss": 9975.280767331178,
+    "train_seg_loss": 0.0,
+    "val_loss": 9944.040771484375,
+    "val_calorie_loss": 9944.040771484375,
+    "val_seg_loss": 0.0,
+    "mae": 70.84443664550781,
+    "mse": 10170.8125,
+    "mape": 8834727936.0
+}
