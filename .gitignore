@@ -1,6 +1,8 @@
 # Large files and training artifacts
 grid_search_results/run_*
 *.pth
+!best_model.pth
+!**/best_model.pth
 *.pt
 *.h5
 *.hdf5
