@@ -1,0 +1,12 @@
+{
+    "fusion": "image_volume",
+    "use_volume": true,
+    "pretrained": false,
+    "dropout_rate": 0.3,
+    "fusion_channels": 2048,
+    "learning_rate": 0.0006,
+    "weight_decay": 1e-06,
+    "batch_size": 32,
+    "img_size": 256,
+    "num_epochs": 40
+}

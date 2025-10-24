@@ -2,8 +2,8 @@
 # Test Set Inference Script
 
 # Default paths
-MODEL_PATH="/data/projects/punim0478/setiawand/Computer-Vision-COMP90086/outputs/experiments/exp14_ensemble_lr_variation/best_model.pth"
-TEST_ROOT="/data/projects/punim0478/setiawand/Computer-Vision-COMP90086/Nutrition5K/Nutrition5K/test"
+MODEL_PATH="/data/projects/punim0478/setiawand/Computer-Vision-COMP90086/experiments/exp5_resnet18_inception_no_aug_20251023_223907/best_model.pth"
+TEST_ROOT="/data/projects/punim0478/setiawand/Computer-Vision-COMP90086/Nutrition5K/test"
 OUTPUT_PATH="../submission.csv"
 BATCH_SIZE=32
 IMG_SIZE=224
