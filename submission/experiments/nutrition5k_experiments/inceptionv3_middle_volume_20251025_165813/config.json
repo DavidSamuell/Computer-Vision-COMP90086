@@ -1,0 +1,12 @@
+{
+    "fusion": "middle",
+    "use_volume": true,
+    "pretrained": false,
+    "dropout_rate": 0.4,
+    "fusion_channels": 2048,
+    "learning_rate": 0.0005,
+    "weight_decay": 1e-05,
+    "batch_size": 32,
+    "img_size": 256,
+    "num_epochs": 40
+}
