@@ -1,8 +1,0 @@
-{
-  "lr": [1e-5, 5e-5, 1e-4, 5e-4],
-  "dropout": [0.3, 0.4, 0.5],
-  "weight_decay": [1e-5, 1e-4, 5e-4],
-  "batch_size": [8, 16, 32],
-  "calorie_weight": [1.0],
-  "seg_weight": [0.3, 0.5, 0.7]
-}

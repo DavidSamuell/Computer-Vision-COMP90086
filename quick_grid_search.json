@@ -1,9 +1,0 @@
-{
-  "_comment": "Smaller grid for faster testing (18 combinations)",
-  "lr": [5e-4, 5e-3],
-  "dropout": [0.4, 0.5],
-  "weight_decay": [1e-4, 5e-4],
-  "batch_size": [64],
-  "calorie_weight": [1.0],
-  "seg_weight": [0.3,0.5, 0.7]
-}
